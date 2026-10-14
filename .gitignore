@@ -1,0 +1,14 @@
+# Never commit mod assets or game data to this repository.
+*.szs
+*.brres
+*.brsar
+*.brwsd
+*.brbnk
+*.tpl
+*.iso
+*.wbfs
+*.rar
+*.zip
+*.7z
+_stage/
+_backup*/
