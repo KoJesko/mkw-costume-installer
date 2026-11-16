@@ -90,7 +90,11 @@ foreach ($f in (Get-ChildItem -LiteralPath $Dir -File -Filter $Filter | Sort-Obj
   $p = $hdr; $wav = 0
   while ($p -lt $g.Length) {             # skip LABL, stop at the wave archive
     $m = MAGIC $g $p
-    if ($m -eq 'LABL') { $p += (BE $g ($p + 4) 4) }
+    if ($m -eq 'LABL') {
+      $len = BE $g ($p + 4) 4
+      if ($len -le 0) { break }          # malformed block: would loop forever
+      $p += $len
+    }
     elseif ($m -eq 'RWAR') { $wav = BE $g ($p + 8) 4; break }
     else { break }
   }

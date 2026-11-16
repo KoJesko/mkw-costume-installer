@@ -193,7 +193,17 @@ if [ "$RESTORE" = 1 ]; then
       done
     done
     [ -f "$B/manifest.txt" ] && while IFS= read -r p; do
-      [ -n "$p" ] && [ ! -f "$B/${p#Character}" ] && run rm -f "$R/$p"
+      [ -n "$p" ] || continue
+      # Only ever delete files this script installs: Character/... or Patches/...,
+      # never an absolute path or one that climbs out of the install.
+      case "$p" in
+        /*|*..*|*\\*) warn "skipping unsafe manifest entry: $p"; continue ;;
+        Character/*|Patches/*) ;;
+        *) warn "skipping unexpected manifest entry: $p"; continue ;;
+      esac
+      # Backups mirror the install layout ($B/Character/...), so a file that has
+      # one was just restored above and must not be deleted.
+      [ ! -f "$B/$p" ] && run rm -f "$R/$p"
     done < "$B/manifest.txt"
     log "restored $R"
   done
