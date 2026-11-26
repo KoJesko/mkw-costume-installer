@@ -1,25 +1,28 @@
 #!/usr/bin/env python3
 """Voice tools for Mario Kart Wii character mods in Retro Rewind.
 
-  convert IN OUT [--remap DONOR:TARGET --sound-archive revo_kart.brsar]
-      Re-encode the wave archive of a .brwsd/.brbnk to mono 16 kHz DSP-ADPCM, the format the
-      game's own voices use. With --remap, also reorder a .brwsd's voice lines from the donor
-      character's layout to the target's (e.g. CA:RS for a pack made over Birdo, installed
-      over Rosalina), matching lines by their names in the sound archive.
-
-  bank SRC OUT --clips N,N,...
-      Build a voice bank (.brbnk) whose program i plays clip N[i] of SRC's wave archive.
-      Rosalina's sequences use programs 0-2 for the star shout and 3-8 for the boost shout.
+  build VOICES OUTDIR --name GRP_VO_RS-1 --sound-archive revo_kart.brsar
+        [--donor CODE] [--layout MR] [--set LINE=N,N,...] [--loudness DB]
+      Build a costume's full voice set from a pack's voice files. Retro Rewind reads a
+      costume's voices in the 78-line layout most characters share (Mario's), not the
+      base character's own: Rosalina's 48-line file is read as if it were Mario's.
+      Every line of the layout is filled from the pack by name. The pack's own lines,
+      its bank (Rosalina keeps her boost shouts there), then the closest line it does
+      have. Clips are re-encoded to mono 16 kHz, the game's voice format, and quiet
+      packs are raised to --loudness.
+        --donor  the character the pack was made for (default: read from file names)
+        --set    pick clips yourself, as clip numbers of the pack's PC .brwsd, for every
+                 variant of a line: --set DSH=3,4,9,13,3,4 --set STRM=6,53,6
 
   clips FILE OUTDIR
-      Export every clip of FILE's wave archive as a WAV, numbered, to pick clips for `bank`.
+      Export every clip of FILE's wave archive as a numbered WAV, to pick clips for --set.
 
   lines FILE
-      Print each voice line and the clip it plays, with clip formats.
+      Print a .brwsd's lines (as clip numbers) and its clip formats.
 
 Needs ffmpeg and dspenc (tools/build-dspenc.sh builds it into tools/bin/).
 """
-import argparse, json, os, re, shutil, struct, subprocess, sys, tempfile, wave
+import argparse, glob, json, math, os, re, shutil, struct, subprocess, sys, tempfile, wave
 
 RATE = 16000
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -29,11 +32,20 @@ u16 = lambda b, o: struct.unpack_from(">H", b, o)[0]
 s16 = lambda b, o: struct.unpack_from(">h", b, o)[0]
 pad = lambda n, a=0x20: (n + a - 1) // a * a
 
-# Lines a donor character has no equivalent for, and the closest line it does have.
-# Birdo (CA) is the case that needs them: she has no wheelie, bump, failed-start,
-# medium-hit, freeze or respawn lines.
-SUBSTITUTES = {"WLE": "DSH", "ATK": "OVTAK", "STR_FAIL": "DMG_S",
-               "DMG_M": "DMG_L", "DMG_FRE": "DMG_S", "RET": "LND_S"}
+# Closest lines to use when a pack has no clip for an event, in order of preference.
+SUBSTITUTES = {
+    "ATK": ["DSH", "ITM_SCES"], "DSH": ["ATK", "ITM_SCES"], "WLE": ["DSH", "ATK"],
+    "WLE_FAIL": ["DMG_S", "STR_FAIL"], "STR_FAIL": ["DMG_S", "WLE_FAIL"],
+    "JP_L": ["JP_ACT", "JP_M"], "JP_M": ["JP_ACT", "JP_S", "JP_L"], "JP_S": ["JP_M", "JP_ACT"],
+    "JP_ACT": ["JP_M", "DSH"], "LND_L": ["LND_S", "JP_S"], "LND_S": ["LND_L", "JP_S"],
+    "OVTAK": ["ITM_SCES", "DSH"], "DMG_L": ["DMG_M", "DMG_S"], "DMG_M": ["DMG_L", "DMG_S"],
+    "DMG_S": ["DMG_M", "DMG_L"], "DMG_SPN": ["DMG_M", "DMG_S"], "DMG_FRE": ["DMG_S", "DMG_M"],
+    "FAL": ["FAL_W", "DMG_L"], "FAL_W": ["FAL", "DMG_L"], "RET": ["RET_W", "LND_S"],
+    "RET_W": ["RET", "LND_S"], "ITM_PUT": ["ITM_TRW", "ITM_SCES"],
+    "ITM_TRW": ["ITM_PUT", "ITM_SCES"], "ITM_SCES": ["ITM_PWUP", "DSH"],
+    "ITM_PWUP": ["ITM_SCES", "DSH"], "STRM": ["ITM_PWUP", "DSH"],
+}
+VARIANT = re.compile(r"(.+?)(_?\d|_END)?$")
 
 
 def dspenc_path():
@@ -43,10 +55,97 @@ def dspenc_path():
     sys.exit("dspenc not found: run tools/build-dspenc.sh, or set DSPENC")
 
 
+# ---------------------------------------------------------------- the sound archive
+
+class Brsar:
+    """Names, voice lines, sequences and group files of revo_kart.brsar."""
+
+    def __init__(self, path):
+        self.b = b = open(path, "rb").read()
+        symb, info = u32(b, 0x10), u32(b, 0x18)
+        sb = symb + 8; nt = sb + u32(b, sb); self.names = []
+        for i in range(u32(b, nt)):
+            s = sb + u32(b, nt + 4 + 4 * i); self.names.append(b[s:b.index(b"\0", s)].decode("latin1"))
+        self.base = base = info + 8
+        self.groups = {}
+        gt = base + u32(b, base + 0x24)
+        for g in range(u32(b, gt)):
+            e = base + u32(b, gt + 4 + 8 * g + 4)
+            self.groups[self._name(u32(b, e))] = e
+        ft = base + u32(b, base + 0x1C)
+        self.file_entries = [base + u32(b, ft + 4 + 8 * i + 4) for i in range(u32(b, ft))]
+        self.waves, self.seqs = [], []  # (name, fileId, index) and (name, fileId, label, program)
+        st = base + u32(b, base + 4)
+        for i in range(u32(b, st)):
+            e = base + u32(b, st + 4 + 8 * i + 4)
+            name, fid, kind, si = self._name(u32(b, e)), u32(b, e + 4), b[e + 0x16], base + u32(b, e + 0x1C)
+            if kind == 3:
+                self.waves.append((name, fid, u32(b, si)))
+            elif kind == 1 and name.startswith("VO_"):
+                self.seqs.append((name, fid, u32(b, si)))
+
+    def _name(self, i):
+        return self.names[i] if i < len(self.names) else ""
+
+    def group_files(self, group):
+        """{'brwsd': bytes, 'brbnk': bytes} of a group, header and wave data joined."""
+        b, base, e = self.b, self.base, self.groups[group]
+        goff, gwoff, it = u32(b, e + 0x10), u32(b, e + 0x18), base + u32(b, e + 0x24)
+        out = {}
+        for i in range(u32(b, it)):
+            x = base + u32(b, it + 4 + 8 * i + 4)
+            off, size, woff, wsize = (u32(b, x + k) for k in (4, 8, 12, 16))
+            head = b[goff + off:goff + off + size]
+            ext = {b"RWSD": "brwsd", b"RBNK": "brbnk"}.get(head[:4])
+            if ext and ext not in out:
+                out[ext] = head + b[gwoff + woff:gwoff + woff + wsize]
+        return out
+
+    def file_bytes(self, fid):
+        b, base = self.b, self.base
+        pos = base + u32(b, self.file_entries[fid] + 0x18)
+        fp = base + u32(b, pos + 8)
+        g = self.groups_by_index()[u32(b, fp)]
+        goff, it = u32(b, g + 0x10), base + u32(b, g + 0x24)
+        x = base + u32(b, it + 4 + 8 * u32(b, fp + 4) + 4)
+        return b[goff + u32(b, x + 4):goff + u32(b, x + 4) + u32(b, x + 8)]
+
+    def groups_by_index(self):
+        if not hasattr(self, "_gidx"):
+            gt = self.base + u32(self.b, self.base + 0x24)
+            self._gidx = [self.base + u32(self.b, gt + 4 + 8 * g + 4) for g in range(u32(self.b, gt))]
+        return self._gidx
+
+    def lines(self, code, npc):
+        """Line names of a character's main (or opponent) voice file, in file order."""
+        pre = f"VO_{code}_NPC_" if npc else f"VO_{code}_"
+        files = {}
+        for name, fid, idx in self.waves:
+            if name.startswith(pre) and (npc or not name.startswith(f"VO_{code}_NPC_")):
+                files.setdefault(fid, {})[idx] = name[len(pre):]
+        if not files:
+            return []
+        d = max(files.values(), key=len)
+        return [d.get(i, "?") for i in range(max(d) + 1)]
+
+    def bank_programs(self, code, npc):
+        """{line name: program} for the voice sequences that play from a character's bank."""
+        pre = f"VO_{code}_NPC_" if npc else f"VO_{code}_"
+        out = {}
+        for name, fid, label in self.seqs:
+            if not name.startswith(pre) or (not npc and name.startswith(f"VO_{code}_NPC_")):
+                continue
+            seq = self.file_bytes(fid)
+            code_at = u32(seq, 0x10) + 0x0C + label
+            ops = seq[code_at:code_at + 16]
+            if 0x81 in ops:  # program change
+                out[name[len(pre):]] = ops[ops.index(0x81) + 1]
+        return out
+
+
 # ---------------------------------------------------------------- wave archives
 
 def archive_offset(b):
-    """Offset of the RWAR that follows a .brwsd/.brbnk header (an optional LABL may sit between)."""
     r = u32(b, 8)
     if b[r:r + 4] == b"LABL":
         r += u32(b, r + 4)
@@ -103,17 +202,24 @@ def read_clip(b, rw):
     return [sum(x[i] for x in chans) // ch for i in range(n)], rate
 
 
+def rms_db(pcm):
+    return 20 * math.log10(max(1.0, math.sqrt(sum(v * v for v in pcm) / max(1, len(pcm)))) / 32768)
+
+
 def write_wav(path, pcm, rate):
     with wave.open(path, "wb") as w:
         w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate)
         w.writeframes(struct.pack(f"<{len(pcm)}h", *pcm))
 
 
-def encode_clip(pcm, rate, tmp):
+def encode_clip(pcm, rate, tmp, gain_db=0.0):
     src, mid, dsp = (os.path.join(tmp, x) for x in ("src.wav", "mid.wav", "out.dsp"))
     write_wav(src, pcm, rate)
+    af = "aresample=resampler=soxr"
+    if gain_db > 0.05:
+        af = f"volume={gain_db:.2f}dB,alimiter=limit=0.97:level=false," + af
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", src, "-ac", "1", "-ar", str(RATE),
-                    "-af", "aresample=resampler=soxr", "-c:a", "pcm_s16le", mid], check=True)
+                    "-af", af, "-c:a", "pcm_s16le", mid], check=True)
     subprocess.run([dspenc_path(), mid, dsp], check=True, stdout=subprocess.DEVNULL)
     d = open(dsp, "rb").read()
     return build_rwav(nibbles=u32(d, 4), coefs=d[0x1C:0x3C], ps=u16(d, 0x3E), data=d[0x60:])
@@ -149,17 +255,10 @@ def build_rwar(rwavs):
     return head + b"\0" * (0x20 - len(head)) + tabl + dblk
 
 
-def reencode_clips(b, pick=None):
-    offs = clip_offsets(b)
-    pick = range(len(offs)) if pick is None else pick
-    with tempfile.TemporaryDirectory() as tmp:
-        return [encode_clip(*read_clip(b, offs[i]), tmp) for i in pick]
-
-
-# ---------------------------------------------------------------- voice lines (RWSD)
+# ---------------------------------------------------------------- lines and banks
 
 def rwsd_lines(b):
-    """For each voice line, the clips it plays."""
+    """For each voice line of an RWSD, the clips it plays."""
     data = u32(b, 0x10); base = data + 8
     lines = []
     for i in range(u32(b, data + 8)):
@@ -169,114 +268,176 @@ def rwsd_lines(b):
     return lines
 
 
-def reorder_lines(head, order):
-    """Point the RWSD's line table at the given old line numbers, in the new order."""
-    h = bytearray(head)
-    data = u32(h, 0x10); old = u32(h, data + 8)
-    if len(order) > old:
-        raise ValueError("the target layout has more lines than the pack; cannot reorder in place")
-    refs = [bytes(h[data + 12 + 8 * i:data + 20 + 8 * i]) for i in range(old)]
-    struct.pack_into(">I", h, data + 8, len(order))
-    for i, j in enumerate(order):
-        h[data + 12 + 8 * i:data + 20 + 8 * i] = refs[j]
-    return bytes(h)
-
-
-def sound_table(brsar):
-    """(name, fileId, index) of every wave sound in revo_kart.brsar."""
-    br = open(brsar, "rb").read()
-    symb, info = u32(br, 0x10), u32(br, 0x18)
-    sb = symb + 8; nt = sb + u32(br, sb); names = []
-    for i in range(u32(br, nt)):
-        s = sb + u32(br, nt + 4 + 4 * i); names.append(br[s:br.index(b"\0", s)].decode("latin1"))
-    base = info + 8; st = base + u32(br, base + 4); out = []
-    for i in range(u32(br, st)):
-        e = base + u32(br, st + 4 + 8 * i + 4)
-        if br[e + 0x16] == 3:  # wave sound
-            out.append((names[u32(br, e)], u32(br, e + 4), u32(br, base + u32(br, e + 0x1C))))
+def bank_waves(b):
+    """Program number -> clip number, for the single-clip programs voice banks use."""
+    data = u32(b, 0x10); base = data + 8
+    out = {}
+    for i in range(u32(b, base)):
+        kind, off = b[base + 4 + 8 * i + 1], u32(b, base + 4 + 8 * i + 4)
+        if kind == 1:
+            out[i] = u32(b, base + off)
     return out
 
 
-def remap_order(table, donor, target, n_donor_lines):
-    """Line order for the target's file, as donor line numbers. Picks the target file whose
-    line count matches the target layout of this file type by finding the donor file with
-    n_donor_lines lines."""
-    def by_file(code):
-        files = {}
-        for name, fid, idx in table:
-            m = re.match(rf"VO_{code}_(.+)$", name)
-            if m:
-                files.setdefault(fid, {})[m.group(1)] = idx
-        return files
-    dfiles, tfiles = by_file(donor), by_file(target)
-    dfile = next((f for f in dfiles.values() if len(f) == n_donor_lines), None)
-    if dfile is None:
-        raise ValueError(f"no {donor} voice file with {n_donor_lines} lines in the sound archive")
-    # the target file covering the same events: the one sharing the most line names
-    tfile = max(tfiles.values(), key=lambda f: len(set(f) & set(dfile)))
-    order, missing = [], []
-    for name, _ in sorted(tfile.items(), key=lambda x: x[1]):
-        m = re.match(r"(.+?)(\d|_END)?$", name)
-        alt = SUBSTITUTES.get(m.group(1), m.group(1)) + (m.group(2) or "")
-        pick = name if name in dfile else alt if alt in dfile else None
-        if pick is None:
-            missing.append(name)
-        else:
-            order.append(dfile[pick])
-    if missing:
-        raise ValueError(f"{donor} has no line for: {', '.join(missing)}")
-    return order
-
-
-# ---------------------------------------------------------------- banks (RBNK)
-
 def build_bank_header(n):
-    """An RBNK with n programs, program i playing clip i: the retail instrument settings."""
-    inst_off = 4 + 8 * n
-    table = struct.pack(">I", n) + b"".join(struct.pack(">BBHI", 1, 1, 0, inst_off + 0x30 * i)
+    """An RBNK with n programs, program i playing clip i, with the retail instrument settings."""
+    table = struct.pack(">I", n) + b"".join(struct.pack(">BBHI", 1, 1, 0, 4 + 8 * n + 0x30 * i)
                                             for i in range(n))
     insts = b"".join(struct.pack(">I", i) + bytes.fromhex("7f7f7f78 7f000000 3c7f4000 3f800000")
                      + b"\0" * 0x1C for i in range(n))
     body = table + insts
     data = b"DATA" + struct.pack(">I", pad(8 + len(body))) + body
     data += b"\0" * (pad(len(data)) - len(data))
-    size = 0x20 + len(data)
-    head = b"RBNK" + struct.pack(">HHIHHII", 0xFEFF, 0x0102, size, 0x20, 1, 0x20, len(data))
+    head = b"RBNK" + struct.pack(">HHIHHII", 0xFEFF, 0x0102, 0x20 + len(data), 0x20, 1, 0x20, len(data))
     return head + b"\0" * (0x20 - len(head)) + data
+
+
+class Pool:
+    """Every clip a pack has for one voice file (main or opponent), by line name."""
+
+    def __init__(self):
+        self.clips = {}   # name -> (file bytes, clip offset): the pack's own lines
+        self.picked = {}  # the same, from --set: used for exactly those lines
+
+    def add(self, name, src, offset):
+        self.clips.setdefault(name, (src, offset))
+
+    def has(self, name):
+        return name in self.clips or name in self.picked
+
+    def find(self, name, fallback=None):
+        if name in self.picked:
+            return self.picked[name]
+        m = VARIANT.match(name); base, tail = m.group(1), m.group(2) or ""
+        tails = [tail, "", "2", "_END"]
+        # stand-ins come from the pack's own clips first, so one --set pick
+        # (say, every boost a "woohoo") doesn't spread to every event borrowing it
+        for clips in (self.clips, self.picked):
+            for cand in [base] + SUBSTITUTES.get(base, []):
+                for t in tails:
+                    if cand + t in clips:
+                        return clips[cand + t]
+        if fallback is not None:
+            return fallback.find(name)
+        raise KeyError(name)
+
+
+def pack_files(voices):
+    """{'PC.brwsd': path, ...} of a pack folder; also returns the character it was made for."""
+    found, donors = {}, set()
+    for p in sorted(glob.glob(os.path.join(voices, "*.brwsd")) + glob.glob(os.path.join(voices, "*.brbnk"))):
+        stem, ext = os.path.splitext(os.path.basename(p))
+        if re.match(r"\d+ ", stem):
+            stem = stem.split(" ", 1)[1]
+        m = re.match(r"GRP_VO_([A-Z]+)(?:-\d+)?_(.+)$", stem)
+        if m:
+            donors.add(m.group(1)); found[f"{m.group(2)}{ext}"] = p
+    return found, donors
+
+
+def build(a):
+    sa = Brsar(a.sound_archive)
+    files, donors = pack_files(a.voices)
+    if not files:
+        sys.exit(f"no voice files in {a.voices}")
+    donor = (a.donor or (donors.pop() if len(donors) == 1 else sys.exit(
+        f"voice files name several characters ({', '.join(sorted(donors))}): pass --donor"))).upper()
+    read = lambda key: open(files[key], "rb").read() if key in files else None
+
+    pools = {}
+    for npc in (False, True):
+        tag = "NPC" if npc else "PC"
+        pool = Pool()
+        wsd, bnk = read(f"{tag}.brwsd"), read(f"{tag}.brbnk")
+        if wsd:
+            names, lines, offs = sa.lines(donor, npc), rwsd_lines(wsd), clip_offsets(wsd)
+            if len(names) != len(lines):
+                sys.exit(f"{files[tag + '.brwsd']}: {len(lines)} lines, but {donor}'s {tag} file has {len(names)}")
+            for name, clips in zip(names, lines):
+                pool.add(name, wsd, offs[clips[0]])
+        if bnk:
+            waves, offs = bank_waves(bnk), clip_offsets(bnk)
+            for name, prog in sa.bank_programs(donor, npc).items():
+                if prog in waves and waves[prog] < len(offs):
+                    pool.add(name, bnk, offs[waves[prog]])
+        pools[tag] = pool
+    # --set picks win over anything the pack had: LINE, LINE2, ... LINE_END in order
+    main = read("PC.brwsd")
+    for spec in a.set or []:
+        line, nums = spec.split("=")
+        picks, offs = [int(x) for x in nums.split(",")], clip_offsets(main)
+        for i, n in enumerate(picks):
+            name = line if i == 0 else f"{line}_END" if i == len(picks) - 1 else f"{line}{i + 1}"
+            for pool in pools.values():
+                pool.picked[name] = (main, offs[n])
+
+    # one gain for the whole pack, so its lines keep their balance
+    sample = [read_clip(*pools["PC"].clips[k]) for k in list(pools["PC"].clips)[:40]]
+    level = sorted(rms_db(p) for p, _ in sample)[len(sample) // 2] if sample else a.loudness
+    gain = max(0.0, a.loudness - level)
+
+    os.makedirs(a.outdir, exist_ok=True)
+    cache, keep = {}, []
+    with tempfile.TemporaryDirectory() as tmp:
+        def clip(src):
+            # keyed by the source's identity, so every source stays referenced: a freed
+            # file's id can be reused by the next one, which would return the wrong clip
+            key = (id(src[0]), src[1])
+            if key not in cache:
+                keep.append(src[0])
+                cache[key] = encode_clip(*read_clip(*src), tmp, gain)
+            return cache[key]
+
+        report = []
+        for npc in (False, True):
+            tag = "NPC" if npc else "PC"
+            groups = sa.group_files(f"GRP_VO_{a.layout}_{tag}")
+            names = sa.lines(a.layout, npc)
+            template = groups["brwsd"]
+            lines = rwsd_lines(template)
+            line_of = {}
+            for li, clips in enumerate(lines):
+                for c in clips:
+                    line_of.setdefault(c, li)
+            fb = pools["PC"] if npc else None
+            rw = []
+            for c in range(len(clip_offsets(template))):
+                name = names[line_of[c]]
+                rw.append(clip(pools[tag].find(name, fb)))
+                if not pools[tag].has(name) and (fb is None or not fb.has(name)):
+                    report.append(f"{tag} {name}")
+            out = template[:u32(template, 8)] + build_rwar(rw)
+            open(os.path.join(a.outdir, f"{a.name}_{tag}.brwsd"), "wb").write(out)
+            # the star shout comes from the bank, by the layout's own program numbers
+            progs = sa.bank_programs(a.layout, npc)
+            if progs:
+                order = sorted(progs.items(), key=lambda x: x[1])
+                n = max(progs.values()) + 1
+                by_prog = {p: name for name, p in order}
+                rw = [clip(pools[tag].find(by_prog.get(p, order[0][0]), fb)) for p in range(n)]
+                open(os.path.join(a.outdir, f"{a.name}_{tag}.brbnk"), "wb").write(build_bank_header(n) + build_rwar(rw))
+        # one-line files (finish lines, cannon) are the same event in every layout
+        for key, path in files.items():
+            stem, ext = os.path.splitext(key)
+            if stem in ("PC", "NPC"):
+                continue
+            b = open(path, "rb").read()
+            head = b[:u32(b, 8)]
+            rw = [clip((b, o)) for o in clip_offsets(b)]
+            open(os.path.join(a.outdir, f"{a.name}_{stem}{ext}"), "wb").write(head + build_rwar(rw))
+    print(f"{a.name}: {donor} pack in {a.layout} layout, gain {gain:+.1f} dB"
+          + (f"; stand-ins for {len(report)} lines: {', '.join(report)}" if report else ""))
 
 
 # ---------------------------------------------------------------- commands
 
-def cmd_convert(a):
-    b = open(a.input, "rb").read()
-    head = b[:u32(b, 8)]
-    # one-line files (finish lines, cannon) are the same event in every layout
-    if a.remap and head[:4] == b"RWSD" and len(rwsd_lines(b)) > 1:
-        donor, target = a.remap.upper().split(":")
-        if donor != target:
-            if not a.sound_archive:
-                sys.exit("--remap needs --sound-archive (revo_kart.brsar)")
-            order = remap_order(sound_table(a.sound_archive), donor, target, len(rwsd_lines(b)))
-            head = reorder_lines(head, order)
-    out = head + build_rwar(reencode_clips(b))
-    open(a.output, "wb").write(out)
-    print(f"{os.path.basename(a.input)}: {len(b)} -> {len(out)} bytes")
-
-
-def cmd_bank(a):
-    b = open(a.source, "rb").read()
-    pick = [int(x) for x in a.clips.split(",")]
-    out = build_bank_header(len(pick)) + build_rwar(reencode_clips(b, pick))
-    open(a.output, "wb").write(out)
-    print(f"{os.path.basename(a.output)}: {len(pick)} programs, {len(out)} bytes")
-
-
 def cmd_clips(a):
     b = open(a.file, "rb").read()
     os.makedirs(a.outdir, exist_ok=True)
-    for i, off in enumerate(clip_offsets(b)):
+    offs = clip_offsets(b)
+    for i, off in enumerate(offs):
         write_wav(os.path.join(a.outdir, f"{i:02d}.wav"), *read_clip(b, off))
-    print(f"{len(clip_offsets(b))} clips -> {a.outdir}")
+    print(f"{len(offs)} clips -> {a.outdir}")
 
 
 def cmd_lines(a):
@@ -291,10 +452,11 @@ def cmd_lines(a):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
-    c = sub.add_parser("convert"); c.add_argument("input"); c.add_argument("output")
-    c.add_argument("--remap"); c.add_argument("--sound-archive"); c.set_defaults(fn=cmd_convert)
-    k = sub.add_parser("bank"); k.add_argument("source"); k.add_argument("output")
-    k.add_argument("--clips", required=True); k.set_defaults(fn=cmd_bank)
+    b = sub.add_parser("build"); b.add_argument("voices"); b.add_argument("outdir")
+    b.add_argument("--name", required=True); b.add_argument("--sound-archive", required=True)
+    b.add_argument("--donor"); b.add_argument("--layout", default="MR")
+    b.add_argument("--set", action="append"); b.add_argument("--loudness", type=float, default=-7.0)
+    b.set_defaults(fn=build)
     x = sub.add_parser("clips"); x.add_argument("file"); x.add_argument("outdir"); x.set_defaults(fn=cmd_clips)
     l = sub.add_parser("lines"); l.add_argument("file"); l.set_defaults(fn=cmd_lines)
     a = p.parse_args()

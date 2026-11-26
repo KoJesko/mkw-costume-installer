@@ -7,7 +7,7 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY=0; RESTORE=0; DO_VOICES=1; DO_MODELS=1
-declare -a SLOTS=() RR_ROOTS=() DVD_ROOTS=() VOICE_DIRS=() BANKS=()
+declare -a SLOTS=() RR_ROOTS=() DVD_ROOTS=() VOICE_DIRS=() VOICE_PICKS=()
 BRSAR=""; SOUND_ARCHIVE=""
 MKWVOICE="$SELF/tools/mkwvoice.py"
 
@@ -24,16 +24,14 @@ usage: install.sh --slot CODE:VARIANT:/path/to/mod [--slot ...] [options]
                            and the unpacked mod folder. Repeatable.
   --voices CODE:VARIANT:DIR  take that slot's voices from DIR instead of the
                            mod's own Voices folder. Repeatable.
-  --bank CODE:VARIANT:N,N,...  build that slot's boost/star bank from clips of
-                           its PC voice file: 9 clip numbers, 0-2 star shout,
-                           3-8 boost shout (list them: tools/mkwvoice.py clips).
-                           Needed when the voices were made for another
-                           character. Repeatable.
+  --pick CODE:VARIANT:LINE=N,N,...  choose that slot's clips for one voice line
+                           yourself, as clip numbers of its PC voice file:
+                           DSH = boost, STRM = star, WLE = wheelie, ...
+                           (list clips: tools/mkwvoice.py clips). Repeatable.
   --rr-root DIR            a Retro Rewind install to patch (default: autodetect)
   --dvd-root DIR           an extracted disc (default: autodetect WiiCompiled's)
-  --sound-archive FILE     revo_kart.brsar to read voice-line names from, for
-                           voices made for another character (default: the
-                           extracted disc's files/sound/revo_kart.brsar)
+  --sound-archive FILE     the game's revo_kart.brsar, for its voice-line names
+                           (default: the extracted disc's files/sound/revo_kart.brsar)
   --brsar FILE             legacy: a prepared revo_kart.brsar to install into
                            the disc (see README: tools/patch-brsar.ps1)
   --no-voices              models and icons only
@@ -54,7 +52,7 @@ while [ $# -gt 0 ]; do
     --voices)    VOICE_DIRS+=("$2"); shift 2 ;;
     --rr-root)   RR_ROOTS+=("$2"); shift 2 ;;
     --dvd-root)  DVD_ROOTS+=("$2"); shift 2 ;;
-    --bank)      BANKS+=("$2"); shift 2 ;;
+    --pick)      VOICE_PICKS+=("$2"); shift 2 ;;
     --brsar)     BRSAR="$2"; shift 2 ;;
     --sound-archive) SOUND_ARCHIVE="$2"; shift 2 ;;
     --no-voices) DO_VOICES=0; shift ;;
@@ -178,7 +176,6 @@ need_voice_tools() {
   [ -x "${DSPENC:-}" ] || [ -x "$SELF/tools/bin/dspenc" ] || command -v dspenc >/dev/null 2>&1 \
     || die "dspenc not found - run tools/build-dspenc.sh once (or pass --no-voices)"
 }
-voice() { run "$PY" "$MKWVOICE" "$@" >/dev/null; }
 
 # ---------------------------------------------------------------------------
 # install
@@ -225,8 +222,7 @@ fi
 [ "$DO_MODELS" = 1 ] && { need_tool wszst; need_tool wimgt; }
 [ "$DO_VOICES" = 1 ] && need_voice_tools
 
-# Voice-line names live in the game's sound archive; they are what lets a pack made
-# for one character be reordered for another.
+# Voice-line names and layouts live in the game's sound archive.
 if [ -z "$SOUND_ARCHIVE" ]; then
   for D in "${DVD_ROOTS[@]:-}"; do
     [ -f "$D/files/sound/revo_kart.brsar" ] && { SOUND_ARCHIVE="$D/files/sound/revo_kart.brsar"; break; }
@@ -289,48 +285,26 @@ for spec in "${SLOTS[@]}"; do
     [ "$vc" = "$CODE" ] && [ "$vv" = "$VAR" ] && VOICEDIR="${vd/#\~/$HOME}"
   done
 
-  BANKCLIPS=""
-  for k in "${BANKS[@]:-}"; do
+  # --pick CODE:VARIANT:LINE=N,N,... for this slot
+  declare -a PICKS=()
+  for k in "${VOICE_PICKS[@]:-}"; do
     [ -n "$k" ] || continue
     kc="${k%%:*}"; krest="${k#*:}"; kv="${krest%%:*}"
-    [ "$kc" = "$CODE" ] && [ "$kv" = "$VAR" ] && BANKCLIPS="${krest#*:}"
+    [ "$kc" = "$CODE" ] && [ "$kv" = "$VAR" ] && PICKS+=(--set "${krest#*:}")
   done
 
   if [ "$DO_VOICES" = 1 ] && [ -d "$VOICEDIR" ]; then
-    n=0; PCFILE=""
-    for f in "$VOICEDIR"/*.brwsd "$VOICEDIR"/*.brbnk; do
-      [ -f "$f" ] || continue
-      b=$(basename "$f"); ext="${b##*.}"; stem="${b%.*}"
-      # Packs name files "<index> GRP_VO_<CODE>_<TYPE>": <CODE> is whoever the pack was
-      # made for, which is not always the character it is installed onto.
-      [[ "${stem%% *}" =~ ^[0-9]+$ ]] && stem="${stem#* }"
-      rest="${stem#GRP_VO_}"; DONOR="${rest%%_*}"; type="${rest#*_}"
-      out="$STAGE/Character/Sound/GRP_VO_${UCODE}-${VAR}_${type}.${ext}"
-      if [ "$ext" = brbnk ] && [ "$DONOR" != "$UCODE" ]; then
-        # A bank is played by the target character's sequences, by program number,
-        # and another character's bank has different programs (Birdo's has no boost
-        # shouts at all). It is rebuilt from --bank clips below instead.
-        continue
-      fi
-      [ "$type" = PC ] && [ "$ext" = brwsd ] && PCFILE="$f"
-      if [ "$DONOR" != "$UCODE" ] && [ "$ext" = brwsd ]; then
-        [ -n "$SOUND_ARCHIVE" ] || die "voices in $VOICEDIR were made for $DONOR, not $UCODE: pass --sound-archive revo_kart.brsar so their lines can be reordered"
-        voice convert "$f" "$out" --remap "$DONOR:$UCODE" --sound-archive "$SOUND_ARCHIVE"
-      else
-        voice convert "$f" "$out"
-      fi
-      n=$((n+1))
-    done
-    if [ -n "$BANKCLIPS" ]; then
-      [ -n "$PCFILE" ] || die "--bank for $CODE-$VAR: no PC .brwsd in $VOICEDIR to take clips from"
-      for t in PC NPC; do
-        voice bank "$PCFILE" "$STAGE/Character/Sound/GRP_VO_${UCODE}-${VAR}_${t}.brbnk" --clips "$BANKCLIPS"
-        n=$((n+1))
-      done
-    elif [ -n "${DONOR:-}" ] && [ "$DONOR" != "$UCODE" ]; then
-      warn "$CODE-$VAR: voices were made for $DONOR, so its boost/star shouts stay stock (pass --bank)"
+    # Retro Rewind reads a costume's voices in Mario's 78-line layout, whatever the
+    # base character, so the whole set is rebuilt in that layout from the pack's
+    # lines by name. See README: How it works.
+    [ -n "$SOUND_ARCHIVE" ] || die "voices need the game's revo_kart.brsar for its voice-line names: pass --sound-archive"
+    out="$STAGE/Character/Sound"
+    if [ "$DRY" = 1 ]; then
+      echo "    [dry-run] build voices from $VOICEDIR as GRP_VO_${UCODE}-${VAR}"
+    else
+      "$PY" "$MKWVOICE" build "$VOICEDIR" "$out" --name "GRP_VO_${UCODE}-${VAR}" \
+          --sound-archive "$SOUND_ARCHIVE" ${PICKS[@]+"${PICKS[@]}"} | sed 's/^/   /'
     fi
-    log "   $n voice files"
   fi
 done
 

@@ -66,7 +66,7 @@ Crypton Future Media, Sonic Team and SEGA.
 ./install.sh --slot rs:1:"~/Downloads/Hatsune Miku" \
              --slot rs:2:"~/Downloads/Kasane Teto" \
              --voices rs:2:"~/Downloads/Teto over Birdo/Voices" \
-             --bank rs:2:6,53,6,3,4,9,13,3,4
+             --pick rs:2:DSH=3,4,9,13,3,4 --pick rs:2:STRM=6,53,6
 ```
 
 `--slot CODE:VARIANT:DIR` — the character code (`rs` is Rosalina), the costume slot,
@@ -90,31 +90,37 @@ character keeps its stock icons.
 
 ### Voices
 
-Voices install when the mod has a `Voices/` folder, or from `--voices`. Every file is
-re-encoded to mono 16 kHz, the format the game's own voices use, and installed as
-`Character/Sound/GRP_VO_<CODE>-<variant>_<TYPE>.<ext>`, where Retro Rewind loads
-costume voices. Each clip stays its own clip.
+Voices install when the mod has a `Voices/` folder, or from `--voices`. The installer
+builds the costume's whole voice set into `Character/Sound/` as
+`GRP_VO_<CODE>-<variant>_<TYPE>.<ext>`, where Retro Rewind loads costume voices:
 
-**Voices made for another character.** Packs name their files
-`<index> GRP_VO_<CODE>_<TYPE>`, where `<CODE>` is the character the pack was made
-for. When that is not the character you install onto, the installer reorders the
-pack's voice lines into the target's layout by their names in the game's sound
-archive (`VO_CA_DMG_L` → `VO_RS_DMG_L`). It reads the names from the extracted disc's
-`revo_kart.brsar`, or from `--sound-archive`. A line the donor has no equivalent for
-gets the closest one it does have: Birdo has no wheelie line, so a wheelie plays her
-boost shout.
+- **In Mario's layout.** Retro Rewind reads a costume's voice file as Mario's 78-line
+  file (the layout most characters share), whatever the base character: a Rosalina
+  costume's line 31 is Mario's second wheelie line, not Rosalina's. Packs come in their
+  character's own layout (Rosalina's has 48 lines, Birdo's 54), so every line is
+  filled by name from the game's sound archive: `VO_RS_DMG_L` goes to Mario's
+  `DMG_L`. Lines the pack keeps in its voice bank, like Rosalina's boost shouts, are
+  taken from there.
+- **Missing events get the closest line the pack has.** Rosalina never had landing or
+  item-throw lines; Birdo has no wheelie or rocket-start lines. The installer prints
+  which lines got a stand-in.
+- **In the game's format.** Every clip is re-encoded to mono 16 kHz, and a pack quieter
+  than the game's voices is raised to match, with a limiter so nothing clips.
 
-**Boost and star shouts** come from a voice bank, not the voice lines, and a bank
-only works for the character it was made for. For a pack made for someone else, pass
-`--bank CODE:VARIANT:` and 9 clip numbers from the pack's PC voice file: the first 3
-are the star shout, the other 6 the boost shout. To pick them, export the clips and
-listen:
+The installer reads the line names from the extracted disc's `revo_kart.brsar`, or from
+`--sound-archive`.
+
+To choose clips yourself, export a pack's clips, listen, and pass their numbers with
+`--pick`, one per variant of the line (most lines have 3, the boost shout `DSH` has 6):
 
 ```bash
 python3 tools/mkwvoice.py clips "<Voices>/659 GRP_VO_CA_PC.brwsd" clips/
+./install.sh ... --pick rs:2:DSH=3,4,9,13,3,4 --pick rs:2:STRM=6,53,6
 ```
 
-Without `--bank`, those shouts stay the base character's.
+`DSH` is the boost shout, `STRM` the star, `WLE` a wheelie and `WLE_FAIL` a wheelie
+that is cancelled, like the wiggle at the start line. A pick only replaces that line:
+events that borrow it as a stand-in still use the pack's own clips.
 
 ---
 
@@ -148,14 +154,16 @@ instead, and the installer now re-encodes them to the game's format (Miku's main
 is 583 KB). It also removes what earlier versions left in `Patches/`, if its manifest
 lists them.
 
-**Voice lines are picked by position, not by name.** Rosalina's main voice file has
-48 lines and Birdo's 54, in a different order. A pack made for Birdo, installed on
-Rosalina as it is, plays the wrong line for most events, so it has to be reordered.
-The sound archive's table names every line, which is what the reorder uses.
+**Voice lines are picked by position, and Retro Rewind uses Mario's positions.** Found
+with diagnostic voice files whose every line says its own number: the start-line wiggle
+played lines 31 and 33 (Mario's `WLE2` and `WLE_FAIL`) and the costume select 4 and 5
+(`DSH2`, `DSH3`). Rosalina's own file has 48 lines and Birdo's 54, each in its own
+order, so a pack installed as it is plays the wrong line for most events. Retro
+Rewind's own Rosalina costumes ship Mario's voice file (`GRP_VO_RS-3_PC.brwsd.mario`).
 
-**Boost and star shouts are sequences.** Rosalina's play programs 0-2 (star) and 3-8
-(boost) of her voice bank. The retail bank only has programs 0-4. Birdo's bank only
-has the star shout, because her boost shouts are voice lines.
+**The star shout is a sequence.** Mario's star shout plays programs 0-2 of his voice
+bank (`STRM`), and his boost shouts are ordinary lines. Rosalina is the odd one out:
+her boost shouts are bank programs 3-8, which is where her packs keep them.
 
 **Rosalina's `CAN_PC` group is empty on retail** — a 64-byte header and a 96-byte wave
 section, the only stub in the whole archive. Her cannon yell plays from the main `PC`
@@ -178,10 +186,9 @@ extract (same SHA-256), and character models, driver models and award models are
 same across discs.
 
 - **Tested:** models on `RMCP01` under WiiCompiled and `RMCE01` under Dolphin with
-  Riivolution. The re-encoded voices and costume icons were installed on Retro
-  Rewind 6.13.5 under WiiCompiled on Linux, and checked file by file (line order,
-  formats, a decode round trip, and the bank clips transcribed back); they have not
-  been heard in a race yet.
+  Riivolution. Voices and costume icons: Miku (a Rosalina pack) and Teto (a Birdo pack)
+  over Rosalina on Retro Rewind 6.13.5 under WiiCompiled on Linux, played in races.
+  Only Rosalina costumes have been tried; other characters should work the same way.
 - **Expected to work, untested:** `RMCJ01`, `RMCK01`, and custom distributions whose
   ID starts with `RMC`.
 - WiiCompiled itself only accepts a clean `RMCP01` dump — that is its restriction,
