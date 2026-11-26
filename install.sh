@@ -7,20 +7,9 @@ set -euo pipefail
 
 SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DRY=0; RESTORE=0; DO_VOICES=1; DO_MODELS=1
-declare -a SLOTS=() RR_ROOTS=() DVD_ROOTS=() VOICE_DIRS=()
-BRSAR=""; ICON_NAME=""
-
-# Character code -> the name retail uses in its UI/minimap textures. These are NOT
-# the same string as the file code, and retail misspells some of them (Funky Kong's
-# minimap really is "st_fuky_32x32.tpl"). Only codes verified against real game
-# files are listed; anything else needs --icon-name.
-icon_name_for() {
-  case "$1" in
-    rs) echo roseta ;;
-    fk) echo fuky   ;;
-    *)  echo ""     ;;
-  esac
-}
+declare -a SLOTS=() RR_ROOTS=() DVD_ROOTS=() VOICE_DIRS=() BANKS=()
+BRSAR=""; SOUND_ARCHIVE=""
+MKWVOICE="$SELF/tools/mkwvoice.py"
 
 die()  { echo "error: $*" >&2; exit 1; }
 warn() { echo "  !! $*" >&2; }
@@ -35,12 +24,18 @@ usage: install.sh --slot CODE:VARIANT:/path/to/mod [--slot ...] [options]
                            and the unpacked mod folder. Repeatable.
   --voices CODE:VARIANT:DIR  take that slot's voices from DIR instead of the
                            mod's own Voices folder. Repeatable.
+  --bank CODE:VARIANT:N,N,...  build that slot's boost/star bank from clips of
+                           its PC voice file: 9 clip numbers, 0-2 star shout,
+                           3-8 boost shout (list them: tools/mkwvoice.py clips).
+                           Needed when the voices were made for another
+                           character. Repeatable.
   --rr-root DIR            a Retro Rewind install to patch (default: autodetect)
-  --dvd-root DIR           an extracted disc to patch the brsar into
-                           (default: autodetect WiiCompiled's GameAssets/DATA)
-  --brsar FILE             a prepared revo_kart.brsar to install for the BASE
-                           costume's voice (see README: tools/patch-brsar.ps1)
-  --icon-name NAME         UI texture name for the character (rs -> roseta)
+  --dvd-root DIR           an extracted disc (default: autodetect WiiCompiled's)
+  --sound-archive FILE     revo_kart.brsar to read voice-line names from, for
+                           voices made for another character (default: the
+                           extracted disc's files/sound/revo_kart.brsar)
+  --brsar FILE             legacy: a prepared revo_kart.brsar to install into
+                           the disc (see README: tools/patch-brsar.ps1)
   --no-voices              models and icons only
   --no-models              voices only
   --restore                put the backed-up originals back and remove our files
@@ -59,8 +54,9 @@ while [ $# -gt 0 ]; do
     --voices)    VOICE_DIRS+=("$2"); shift 2 ;;
     --rr-root)   RR_ROOTS+=("$2"); shift 2 ;;
     --dvd-root)  DVD_ROOTS+=("$2"); shift 2 ;;
+    --bank)      BANKS+=("$2"); shift 2 ;;
     --brsar)     BRSAR="$2"; shift 2 ;;
-    --icon-name) ICON_NAME="$2"; shift 2 ;;
+    --sound-archive) SOUND_ARCHIVE="$2"; shift 2 ;;
     --no-voices) DO_VOICES=0; shift ;;
     --no-models) DO_MODELS=0; shift ;;
     --restore)   RESTORE=1; shift ;;
@@ -75,27 +71,32 @@ done
 # ---------------------------------------------------------------------------
 
 # WiiCompiled keeps its settings in UserData/Config.toml next to the install when
-# portable.txt is present, otherwise under LOCALAPPDATA. Both carry the absolute
-# path of the Retro Rewind tree it loads, which is the one worth patching.
-wiicompiled_roots() {
-  local cfg rr
-  for cfg in \
+# portable.txt is present, otherwise under LOCALAPPDATA on Windows and
+# $XDG_DATA_HOME/WiiCompiled on Linux (inside Wheel Wizard's Flatpak data folder
+# when installed from Flathub). They carry the absolute path of the Retro Rewind
+# tree it loads, which is the one worth patching.
+wiicompiled_configs() {
+  printf '%s\n' \
       "${WIICOMPILED:-}/UserData/Config.toml" \
       "$HOME"/Documents/*/Recomp/UserData/Config.toml \
       "$HOME"/Documents/*/*/Recomp/UserData/Config.toml \
-      "${LOCALAPPDATA:-$HOME/AppData/Local}"/WiiCompiled/Config.toml ; do
+      "${LOCALAPPDATA:-$HOME/AppData/Local}"/WiiCompiled/Config.toml \
+      "${XDG_DATA_HOME:-$HOME/.local/share}"/WiiCompiled/Config.toml \
+      "$HOME"/.var/app/io.github.TeamWheelWizard.WheelWizard/data/WiiCompiled/Config.toml
+}
+
+wiicompiled_roots() {
+  local cfg rr
+  while IFS= read -r cfg; do
     [ -f "$cfg" ] || continue
     rr=$(sed -n 's/^[[:space:]]*retro_rewind_root[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$cfg" | head -1)
     [ -n "$rr" ] && to_unix_path "$rr"
-  done
+  done < <(wiicompiled_configs)
 }
 
 wiicompiled_dvd_roots() {
   local cfg d
-  for cfg in \
-      "${WIICOMPILED:-}/UserData/Config.toml" \
-      "$HOME"/Documents/*/Recomp/UserData/Config.toml \
-      "$HOME"/Documents/*/*/Recomp/UserData/Config.toml ; do
+  while IFS= read -r cfg; do
     [ -f "$cfg" ] || continue
     d=$(sed -n 's/^[[:space:]]*dvd_root[[:space:]]*=[[:space:]]*"\(.*\)".*/\1/p' "$cfg" | head -1)
     [ -n "$d" ] || continue
@@ -104,7 +105,7 @@ wiicompiled_dvd_roots() {
       # a relative dvd_root resolves against the folder holding Config.toml
       *) (cd "$(dirname "$cfg")" 2>/dev/null && cd "$d" 2>/dev/null && pwd) || true ;;
     esac
-  done
+  done < <(wiicompiled_configs)
 }
 
 to_unix_path() {
@@ -169,6 +170,16 @@ find_icon() { # $1 mod dir, $2 "minimap"|"menu"
 
 need_tool() { command -v "$1" >/dev/null 2>&1 || die "$1 not found in PATH (Wiimms SZS Tools)"; }
 
+# Voices are re-encoded, which needs Python 3, ffmpeg and dspenc.
+PY=$(command -v python3 || command -v python || true)
+need_voice_tools() {
+  [ -n "$PY" ] || die "python3 not found (needed to convert voices; or pass --no-voices)"
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found (needed to convert voices; or pass --no-voices)"
+  [ -x "${DSPENC:-}" ] || [ -x "$SELF/tools/bin/dspenc" ] || command -v dspenc >/dev/null 2>&1 \
+    || die "dspenc not found - run tools/build-dspenc.sh once (or pass --no-voices)"
+}
+voice() { run "$PY" "$MKWVOICE" "$@" >/dev/null; }
+
 # ---------------------------------------------------------------------------
 # install
 # ---------------------------------------------------------------------------
@@ -186,7 +197,7 @@ if [ "$RESTORE" = 1 ]; then
   for R in "${RR_ROOTS[@]}"; do
     B="$R/_backup_preCostumes"
     [ -d "$B" ] || { warn "no backup in $R"; continue; }
-    for sub in "" /AllKart /Driver /Map; do
+    for sub in "" /AllKart /Driver /Map /Portrait /Sound; do
       [ -d "$B/Character$sub" ] || continue
       for f in "$B/Character$sub"/*; do
         [ -f "$f" ] && run cp "$f" "$R/Character$sub/"
@@ -212,11 +223,19 @@ fi
 
 [ ${#SLOTS[@]} -gt 0 ] || die "nothing to do - pass at least one --slot (try --help)"
 [ "$DO_MODELS" = 1 ] && { need_tool wszst; need_tool wimgt; }
+[ "$DO_VOICES" = 1 ] && need_voice_tools
+
+# Voice-line names live in the game's sound archive; they are what lets a pack made
+# for one character be reordered for another.
+if [ -z "$SOUND_ARCHIVE" ]; then
+  for D in "${DVD_ROOTS[@]:-}"; do
+    [ -f "$D/files/sound/revo_kart.brsar" ] && { SOUND_ARCHIVE="$D/files/sound/revo_kart.brsar"; break; }
+  done
+fi
 
 STAGE=$(mktemp -d); trap 'rm -rf "$STAGE"' EXIT
-mkdir -p "$STAGE"/Character/{AllKart,Driver,Map} "$STAGE"/Patches
+mkdir -p "$STAGE"/Character/{AllKart,Driver,Map,Portrait,Sound} "$STAGE"/Patches
 
-BASE_VARIANT=""
 for spec in "${SLOTS[@]}"; do
   CODE="${spec%%:*}"; rest="${spec#*:}"; VAR="${rest%%:*}"; MOD="${rest#*:}"
   MOD="${MOD/#\~/$HOME}"
@@ -245,26 +264,19 @@ for spec in "${SLOTS[@]}"; do
       run cp "$dv" "$STAGE/Character/Driver/${CODE}-${VAR}.brres"
     else warn "no menu model in Driver/"; fi
 
+    # Icons are per costume: Retro Rewind shows Character/Portrait/<code>-<v>-css.tpl
+    # on the costume's select screen and Character/Map/<code>-<v>.tpl on the
+    # minimap, so the base character keeps its own icons.
     mini=$(find_icon "$MOD" minimap); menu=$(find_icon "$MOD" menu)
-    if [ -n "$mini" ]; then
-      run wimgt ENCODE "$mini" --dest "$STAGE/Character/Map/${CODE}-${VAR}.tpl" \
-          --transform TPL.RGB5A3 --overwrite
-    fi
-    # Award models and the character-select icon are per-character, not
-    # per-costume: the game has one of each, so only the base slot supplies them.
+    [ -n "$mini" ] && run wimgt ENCODE "$mini" --dest "$STAGE/Character/Map/${CODE}-${VAR}.tpl" \
+        --transform TPL.RGB5A3 --overwrite
+    [ -n "$menu" ] && run wimgt ENCODE "$menu" --dest "$STAGE/Character/Portrait/${CODE}-${VAR}-css.tpl" \
+        --transform TPL.RGB5A3 --overwrite
+    # Award models are per character, not per costume: only the base slot supplies them.
     if [ "$VAR" = 1 ]; then
       for aw in "$MOD/Award/$CODE.brres" "$MOD/Award/${CODE}3.brres"; do
         [ -f "$aw" ] && run cp "$aw" "$STAGE/Patches/$(basename "$aw")"
       done
-      iname="${ICON_NAME:-$(icon_name_for "$CODE")}"
-      if [ -n "$iname" ]; then
-        [ -n "$menu" ] && run wimgt ENCODE "$menu" --dest "$STAGE/Patches/tt_${iname}_64x64.tpl" \
-            --transform TPL.RGB5A3 --overwrite
-        [ -n "$mini" ] && run wimgt ENCODE "$mini" --dest "$STAGE/Patches/st_${iname}_32x32.tpl" \
-            --transform TPL.RGB5A3 --overwrite
-      else
-        warn "no UI texture name known for '$CODE' - icons skipped (pass --icon-name)"
-      fi
     fi
   fi
 
@@ -277,31 +289,48 @@ for spec in "${SLOTS[@]}"; do
     [ "$vc" = "$CODE" ] && [ "$vv" = "$VAR" ] && VOICEDIR="${vd/#\~/$HOME}"
   done
 
+  BANKCLIPS=""
+  for k in "${BANKS[@]:-}"; do
+    [ -n "$k" ] || continue
+    kc="${k%%:*}"; krest="${k#*:}"; kv="${krest%%:*}"
+    [ "$kc" = "$CODE" ] && [ "$kv" = "$VAR" ] && BANKCLIPS="${krest#*:}"
+  done
+
   if [ "$DO_VOICES" = 1 ] && [ -d "$VOICEDIR" ]; then
-    n=0
+    n=0; PCFILE=""
     for f in "$VOICEDIR"/*.brwsd "$VOICEDIR"/*.brbnk; do
       [ -f "$f" ] || continue
       b=$(basename "$f"); ext="${b##*.}"; stem="${b%.*}"
-      # "<index> GRP_VO_<CODE>_<TYPE>" - the index is the file's slot in the sound
-      # archive, and <CODE> is whoever the pack was authored over, not necessarily
-      # the character we are installing onto.
-      id="${stem%% *}"
-      type="${stem#"$id "}"; type="${type#GRP_VO_}"; type="${type#*_}"
-      if [ "$VAR" = 1 ] && [[ "$id" =~ ^[0-9]+$ ]]; then
-        # Base costume: a whole-file override keyed by the file's brsar index,
-        # which is the convention the mod authors document and the one Pulsar
-        # resolves as /patches/<fileId>.<ext>. It does not depend on knowing how
-        # the pack numbers its costumes.
-        run cp "$f" "$STAGE/Patches/${id}.${ext}"
+      # Packs name files "<index> GRP_VO_<CODE>_<TYPE>": <CODE> is whoever the pack was
+      # made for, which is not always the character it is installed onto.
+      [[ "${stem%% *}" =~ ^[0-9]+$ ]] && stem="${stem#* }"
+      rest="${stem#GRP_VO_}"; DONOR="${rest%%_*}"; type="${rest#*_}"
+      out="$STAGE/Character/Sound/GRP_VO_${UCODE}-${VAR}_${type}.${ext}"
+      if [ "$ext" = brbnk ] && [ "$DONOR" != "$UCODE" ]; then
+        # A bank is played by the target character's sequences, by program number,
+        # and another character's bank has different programs (Birdo's has no boost
+        # shouts at all). It is rebuilt from --bank clips below instead.
+        continue
+      fi
+      [ "$type" = PC ] && [ "$ext" = brwsd ] && PCFILE="$f"
+      if [ "$DONOR" != "$UCODE" ] && [ "$ext" = brwsd ]; then
+        [ -n "$SOUND_ARCHIVE" ] || die "voices in $VOICEDIR were made for $DONOR, not $UCODE: pass --sound-archive revo_kart.brsar so their lines can be reordered"
+        voice convert "$f" "$out" --remap "$DONOR:$UCODE" --sound-archive "$SOUND_ARCHIVE"
       else
-        # Extra costumes get a per-variant voice, the form Retro Rewind ships
-        # for its own alternate costumes.
-        run cp "$f" "$STAGE/Patches/GRP_VO_${UCODE}-${VAR}_${type}.${ext}"
+        voice convert "$f" "$out"
       fi
       n=$((n+1))
     done
+    if [ -n "$BANKCLIPS" ]; then
+      [ -n "$PCFILE" ] || die "--bank for $CODE-$VAR: no PC .brwsd in $VOICEDIR to take clips from"
+      for t in PC NPC; do
+        voice bank "$PCFILE" "$STAGE/Character/Sound/GRP_VO_${UCODE}-${VAR}_${t}.brbnk" --clips "$BANKCLIPS"
+        n=$((n+1))
+      done
+    elif [ -n "${DONOR:-}" ] && [ "$DONOR" != "$UCODE" ]; then
+      warn "$CODE-$VAR: voices were made for $DONOR, so its boost/star shouts stay stock (pass --bank)"
+    fi
     log "   $n voice files"
-    [ "$VAR" = 1 ] && BASE_VARIANT=1
   fi
 done
 
@@ -311,15 +340,29 @@ done
 for R in "${RR_ROOTS[@]}"; do
   [ -d "$R" ] || { warn "skipping missing $R"; continue; }
   B="$R/_backup_preCostumes"
-  run mkdir -p "$B"/Character/{AllKart,Driver,Map} "$R"/{Patches,MyStuff} "$R"/Character/{AllKart,Driver,Map}
+  run mkdir -p "$B"/Character/{AllKart,Driver,Map,Portrait,Sound} "$R"/{Patches,MyStuff} \
+      "$R"/Character/{AllKart,Driver,Map,Portrait,Sound}
 
   # MyStuff wins over Character\ for files that exist on the retail disc, so a
   # stale costume file left there silently masks everything installed below.
   M="$R/MyStuff"
   run rm -f "$M"/*-[a-z][a-z]-[0-9].szs "$M"/[a-z][a-z]-[0-9].brres "$M"/[a-z][a-z]-[0-9].tpl
 
+  # Earlier versions of this installer put voices and the base character's icons in
+  # Patches/. Patches/ is patched into the sound archive in place, where a voice
+  # larger than its slot plays other sound data; the icons replaced the base
+  # character's own. Remove those, but only files our previous manifest lists.
+  if [ -f "$B/manifest.txt" ]; then
+    while IFS= read -r p; do
+      case "$p" in
+        Patches/GRP_VO_*|Patches/[0-9]*.brwsd|Patches/[0-9]*.brbnk|Patches/tt_*_64x64.tpl|Patches/st_*_32x32.tpl)
+          [ -f "$R/$p" ] && run rm -f "$R/$p" ;;
+      esac
+    done < "$B/manifest.txt"
+  fi
+
   : > "$STAGE/manifest.txt"
-  for sub in "" /AllKart /Driver /Map; do
+  for sub in "" /AllKart /Driver /Map /Portrait /Sound; do
     for f in "$STAGE/Character$sub"/*; do
       [ -f "$f" ] || continue
       o="$R/Character$sub/$(basename "$f")"

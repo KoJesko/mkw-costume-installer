@@ -12,3 +12,6 @@
 *.7z
 _stage/
 _backup*/
+*.wav
+tools/bin/
+__pycache__/

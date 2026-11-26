@@ -55,45 +55,66 @@ Crypton Future Media, Sonic Team and SEGA.
 
 - `bash` — Git Bash on Windows, or any Linux/macOS shell
 - [Wiimms SZS Tools](https://szs.wiimm.de/) for `wszst` and `wimgt`, on your `PATH`
-- A Retro Rewind install
-- Only for building a sound archive yourself: BrawlCrate, and 32-bit PowerShell
+- A Retro Rewind install, 6.13.5 or newer (costume voices and icons)
+- For voices: Python 3, `ffmpeg`, and `dspenc`. Build `dspenc` once with
+  `tools/build-dspenc.sh` (it downloads and compiles
+  [gc-dspadpcm-encode](https://github.com/jackoalan/gc-dspadpcm-encode), MIT).
 
 ## Usage
 
 ```bash
 ./install.sh --slot rs:1:"~/Downloads/Hatsune Miku" \
-             --slot rs:2:"~/Downloads/Kasane Teto"
+             --slot rs:2:"~/Downloads/Kasane Teto" \
+             --voices rs:2:"~/Downloads/Teto over Birdo/Voices" \
+             --bank rs:2:6,53,6,3,4,9,13,3,4
 ```
 
 `--slot CODE:VARIANT:DIR` — the character code (`rs` is Rosalina), the costume slot,
 and the unpacked mod folder. Repeat it for each costume.
 
 The installer finds your Retro Rewind install on its own: it reads WiiCompiled's
-`Config.toml` for the tree that launcher actually loads, and looks in the usual
-Dolphin and SD-card locations. Override with `--rr-root`. Use `--dry-run` to see
-what it would do, and `--restore` to put the originals back.
+`Config.toml` for the tree that launcher actually loads (on Windows, and on Linux
+including Wheel Wizard's Flatpak), and looks in the usual Dolphin and SD-card
+locations. Override with `--rr-root`. Use `--dry-run` to see what it would do, and
+`--restore` to put the originals back.
 
 Mods are expected in the layout the MKWii character-mod scene uses — `Race/`,
 `Driver/`, `Award/`, `Icons/`, `Voices/`, and `<code>-allkart.szs`. Both mods above
 follow it.
 
+### Icons
+
+Each costume gets its own icons: `Character/Portrait/<code>-<v>-css.tpl` on the
+character-select screen and `Character/Map/<code>-<v>.tpl` on the minimap. The base
+character keeps its stock icons.
+
 ### Voices
 
-Voices install automatically when the mod has a `Voices/` folder, by whichever route
-is correct for that slot:
+Voices install when the mod has a `Voices/` folder, or from `--voices`. Every file is
+re-encoded to mono 16 kHz, the format the game's own voices use, and installed as
+`Character/Sound/GRP_VO_<CODE>-<variant>_<TYPE>.<ext>`, where Retro Rewind loads
+costume voices. Each clip stays its own clip.
 
-- **Costume 1** (the base character) gets **whole-file overrides named by index** —
-  `94.brwsd`, `471.brbnk` — the convention the mod authors document and the one the
-  engine resolves as `/patches/<fileId>.<ext>`. It does not depend on knowing how a
-  pack numbers its costumes.
-- **Costume 2 and up** get `GRP_VO_<CODE>-<variant>_<TYPE>.<ext>`, the form Retro
-  Rewind ships for its own alternate costumes.
+**Voices made for another character.** Packs name their files
+`<index> GRP_VO_<CODE>_<TYPE>`, where `<CODE>` is the character the pack was made
+for. When that is not the character you install onto, the installer reorders the
+pack's voice lines into the target's layout by their names in the game's sound
+archive (`VO_CA_DMG_L` → `VO_RS_DMG_L`). It reads the names from the extracted disc's
+`revo_kart.brsar`, or from `--sound-archive`. A line the donor has no equivalent for
+gets the closest one it does have: Birdo has no wheelie line, so a wheelie plays her
+boost shout.
 
-If a voice still does not play, run the fit checker before anything else:
+**Boost and star shouts** come from a voice bank, not the voice lines, and a bank
+only works for the character it was made for. For a pack made for someone else, pass
+`--bank CODE:VARIANT:` and 9 clip numbers from the pack's PC voice file: the first 3
+are the star shout, the other 6 the boost shout. To pick them, export the clips and
+listen:
 
-```powershell
-powershell -File tools\slot-fit.ps1 -Brsar <revo_kart.brsar> -Dir <RetroRewind6\Patches>
+```bash
+python3 tools/mkwvoice.py clips "<Voices>/659 GRP_VO_CA_PC.brwsd" clips/
 ```
+
+Without `--bank`, those shouts stay the base character's.
 
 ---
 
@@ -117,28 +138,35 @@ Rosalina-rigged model on Funky Kong crashes with an invalid read even when the
 animation sets match exactly, because the models carry different weights — Rosalina's
 has ten textures against Funky's five.
 
-**Voices are patched into the sound archive in place, so they have to fit.** Each
-loose file needs both halves inside the slot the archive reserves: its own declared
-header size, and the size of the `RWAR` wave block that follows. Overflow is handled,
-not fatal — the engine bounds-checks first and either allocates an external buffer or
-drops that one override — so it surfaces as a wrong or missing clip. A voice pack cut
-for one character rarely fits another's slots: Teto's files were authored over Birdo,
-and five of fifteen overflowed Rosalina's.
+**Voice files in `Patches/` are patched into the sound archive in place, and an
+oversized one plays other sounds.** Earlier versions of this installer put voices
+there. Mod voice packs are often stereo 48 kHz, while the game's voices are mono
+16 kHz: Miku's main voice file was 3.4 MB against Rosalina's 410 KB slot. Clips past
+the slot point into whatever sound data follows, so one event played a mix of
+unrelated sounds. Retro Rewind 6.13.5 loads costume voices from `Character/Sound/`
+instead, and the installer now re-encodes them to the game's format (Miku's main file
+is 583 KB). It also removes what earlier versions left in `Patches/`, if its manifest
+lists them.
 
-A pack's own archive is the exception. Build the brsar from the same files you install
-loose and every slot is sized to fit them exactly, because that is where the sizes
-came from.
+**Voice lines are picked by position, not by name.** Rosalina's main voice file has
+48 lines and Birdo's 54, in a different order. A pack made for Birdo, installed on
+Rosalina as it is, plays the wrong line for most events, so it has to be reordered.
+The sound archive's table names every line, which is what the reorder uses.
+
+**Boost and star shouts are sequences.** Rosalina's play programs 0-2 (star) and 3-8
+(boost) of her voice bank. The retail bank only has programs 0-4. Birdo's bank only
+has the star shout, because her boost shouts are voice lines.
 
 **Rosalina's `CAN_PC` group is empty on retail** — a 64-byte header and a 96-byte wave
 section, the only stub in the whole archive. Her cannon yell plays from the main `PC`
-bank. Forcing a foreign file into that group is the one genuinely risky move here: the
-game would index wave entries that are not there, which is a crash, not an overflow.
+bank.
 
 **WiiCompiled mounts only Retro Rewind's pack patch.** Its log says
 `1 active patch(es)`, which means `MyStuff\` is never mounted and anything placed
 there is ignored. It also boots from an extracted disc, not an ISO, so a patched
 sound archive has to be written into `Install/GameAssets/DATA/files/sound/`. The
-`--brsar` flag does that, keeping the original alongside it.
+`--brsar` flag does that, keeping the original alongside it. With Retro Rewind
+6.13.5's `Character/Sound/` this is no longer needed for costume voices.
 
 ---
 
@@ -149,16 +177,18 @@ archive in particular is **byte-identical** between a USA dump and WiiCompiled's
 extract (same SHA-256), and character models, driver models and award models are the
 same across discs.
 
-- **Tested:** `RMCP01` under WiiCompiled, `RMCE01` under Dolphin with Riivolution.
+- **Tested:** models on `RMCP01` under WiiCompiled and `RMCE01` under Dolphin with
+  Riivolution. The re-encoded voices and costume icons were installed on Retro
+  Rewind 6.13.5 under WiiCompiled on Linux, and checked file by file (line order,
+  formats, a decode round trip, and the bank clips transcribed back); they have not
+  been heard in a race yet.
 - **Expected to work, untested:** `RMCJ01`, `RMCK01`, and custom distributions whose
   ID starts with `RMC`.
 - WiiCompiled itself only accepts a clean `RMCP01` dump — that is its restriction,
   upstream, not this script's.
 
-Character-select and minimap textures are named per character inside the game's UI
-archives, and retail misspells some of them (Funky Kong's minimap really is
-`st_fuky_32x32.tpl`). Only names verified against real game files are built in —
-`rs` → `roseta`, `fk` → `fuky`. For any other character, pass `--icon-name`.
+`tools/slot-fit.ps1` and `tools/patch-brsar.ps1` are for the older in-place route
+(`Patches/` and a patched `revo_kart.brsar`). The installer no longer needs them.
 
 ## License
 
